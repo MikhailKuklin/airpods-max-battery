@@ -35,20 +35,25 @@ def segments(rows):
     return segs
 
 
-def slope_pct_per_hr(seg):
-    """Least-squares %/hour drain over a discharge run (positive = draining)."""
-    t0 = seg[0][0]
-    xs = [(e - t0) / 3600 for e, _ in seg]
-    ys = [p for _, p in seg]
-    n = len(xs)
-    sx, sy = sum(xs), sum(ys)
-    sxx = sum(x * x for x in xs)
-    sxy = sum(x * y for x, y in zip(xs, ys))
-    denom = n * sxx - sx * sx
-    if denom == 0:
+GAP_MINUTES = 15.0  # a gap bigger than this = headset put away → excluded
+
+
+def active_drain(seg):
+    """(%/hour of ACTUAL use, active_hours) over a discharge run, excluding idle
+    gaps. Intervals longer than GAP_MINUTES (headset asleep / not broadcasting)
+    contribute neither time nor drop, so the rate reflects real listening."""
+    active_h, drop = 0.0, 0.0
+    for (e0, p0), (e1, p1) in zip(seg, seg[1:]):
+        if p1 > p0 + 2:            # charge blip inside the run
+            continue
+        dt = (e1 - e0) / 3600
+        if dt <= 0 or dt > GAP_MINUTES / 60:   # idle gap → skip
+            continue
+        active_h += dt
+        drop += (p0 - p1)
+    if active_h <= 0 or drop <= 0:
         return None
-    slope = (n * sxy - sx * sy) / denom
-    return -slope if slope < 0 else None
+    return drop / active_h, active_h
 
 
 def sparkline(seg, width=60):
@@ -89,18 +94,19 @@ def main():
 
     rates = []
     for i, seg in enumerate(segs, 1):
-        r = slope_pct_per_hr(seg)
-        dur = (seg[-1][0] - seg[0][0]) / 3600
-        drop = seg[0][1] - seg[-1][1]
+        res = active_drain(seg)
+        elapsed = (seg[-1][0] - seg[0][0]) / 3600      # calendar span
         t = lambda e: datetime.fromtimestamp(e, tz=timezone.utc).astimezone().strftime("%b %d %H:%M")
         print(f"  Run {i}: {seg[0][1]:>3d}% → {seg[-1][1]:>3d}%   "
-              f"{t(seg[0][0])} … {t(seg[-1][0])}  ({fmt_h(dur)})")
+              f"{t(seg[0][0])} … {t(seg[-1][0])}  (elapsed {fmt_h(elapsed)})")
         print(f"         {sparkline(seg)}")
-        if r:
+        if res:
+            r, active_h = res
             rates.append(r)
-            print(f"         drain {r:5.1f}%/hr  →  full charge lasts ~{fmt_h(100/r)}\n")
+            print(f"         {fmt_h(active_h)} of actual use, drain {r:5.1f}%/hr"
+                  f"  →  full charge lasts ~{fmt_h(100/r)} of listening\n")
         else:
-            print()
+            print("         (not enough contiguous in-use data)\n")
 
     if rates:
         avg = sum(rates) / len(rates)

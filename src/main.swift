@@ -30,38 +30,34 @@ struct Sample { let t: Date; let pct: Int }
 
 // ── Rolling analysis over the CSV ──────────────────────────────────────────
 final class Analyzer {
-    // Linear fit of pct vs. hours over the current discharge segment.
-    // Returns (%/hour drain, r²) or nil if not enough monotonic-down data.
+    // Active drain rate over the current discharge cycle, EXCLUDING idle time.
+    // We log ~every 2 min while the Max are in use and broadcasting; a gap
+    // larger than GAP_MINUTES means they were put away/asleep, so that interval
+    // contributes neither elapsed time nor battery drop. Rate is therefore
+    // %-per-hour-of-actual-use, and fullRuntime is hours of listening, not
+    // calendar hours.
+    static let GAP_MINUTES = 15.0
+
     static func drain(_ s: [Sample]) -> (rate: Double, hoursToEmpty: Double,
                                          fullRuntime: Double)? {
         guard s.count >= 2 else { return nil }
-        // Take the tail since the last charge (pct went up) — that's the
-        // current discharge run.
-        var run: [Sample] = []
-        for sample in s.reversed() {
-            if let last = run.last, sample.pct < last.pct - 3 { break } // a jump up going backwards = a charge event
-            run.append(sample)
+        let sorted = s.sorted { $0.t < $1.t }
+        var activeHours = 0.0, drop = 0.0
+        // Walk backward from the newest sample until the last charge event,
+        // summing only contiguous (in-use) intervals.
+        for i in stride(from: sorted.count - 1, to: 0, by: -1) {
+            let newer = sorted[i], older = sorted[i - 1]
+            if newer.pct > older.pct + 2 { break }        // charge → end of cycle
+            let dt = newer.t.timeIntervalSince(older.t) / 3600.0
+            if dt <= 0 || dt > GAP_MINUTES / 60.0 { continue }  // idle gap → skip
+            activeHours += dt
+            drop += Double(older.pct - newer.pct)          // ≥0 while discharging
         }
-        run.reverse()
-        guard run.count >= 2, let first = run.first, let last = run.last,
-              last.pct < first.pct else { return nil }
-        // Least-squares slope of pct over hours.
-        let t0 = first.t.timeIntervalSince1970
-        let xs = run.map { ($0.t.timeIntervalSince1970 - t0) / 3600.0 }
-        let ys = run.map { Double($0.pct) }
-        let n = Double(xs.count)
-        let sx = xs.reduce(0,+), sy = ys.reduce(0,+)
-        let sxx = zip(xs,xs).map(*).reduce(0,+)
-        let sxy = zip(xs,ys).map(*).reduce(0,+)
-        let denom = n*sxx - sx*sx
-        guard denom != 0 else { return nil }
-        let slope = (n*sxy - sx*sy) / denom          // %/hour (negative)
-        guard slope < 0 else { return nil }
-        let rate = -slope                             // %/hour drain, positive
+        guard activeHours > 0, drop > 0 else { return nil }
+        let rate = drop / activeHours                       // %/hour of use
         guard rate > 0.01 else { return nil }
-        let toEmpty = Double(last.pct) / rate
-        let full = 100.0 / rate
-        return (rate, toEmpty, full)
+        let last = sorted.last!.pct
+        return (rate, Double(last) / rate, 100.0 / rate)
     }
 }
 
