@@ -1,0 +1,15 @@
+# build artifact
+AirPodsMaxBattery.app/
+
+# personal battery data + logs
+battery_log.csv
+battery_log.wrongbyte.csv
+monitor.log
+
+# compiled probe binaries (only .swift/.m sources are tracked)
+probe/*
+!probe/*.swift
+!probe/*.m
+
+# macOS cruft
+.DS_Store
