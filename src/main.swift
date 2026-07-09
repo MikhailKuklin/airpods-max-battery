@@ -30,34 +30,92 @@ struct Sample { let t: Date; let pct: Int }
 
 // ── Rolling analysis over the CSV ──────────────────────────────────────────
 final class Analyzer {
-    // Active drain rate over the current discharge cycle, EXCLUDING idle time.
-    // We log ~every 2 min while the Max are in use and broadcasting; a gap
-    // larger than GAP_MINUTES means they were put away/asleep, so that interval
-    // contributes neither elapsed time nor battery drop. Rate is therefore
-    // %-per-hour-of-actual-use, and fullRuntime is hours of listening, not
-    // calendar hours.
+    // Active drain rate EXCLUDING idle time. We log ~every 2 min while the Max
+    // are in use and broadcasting; a gap larger than GAP_MINUTES means they were
+    // put away/asleep, so that interval contributes neither elapsed time nor
+    // battery drop. Rate is therefore %-per-hour-of-actual-use, and runtimes are
+    // hours of listening, not calendar hours.
     static let GAP_MINUTES = 15.0
+    static let CHARGE_JUMP = 2   // a rise of more than this % = a charge event
 
-    static func drain(_ s: [Sample]) -> (rate: Double, hoursToEmpty: Double,
-                                         fullRuntime: Double)? {
-        guard s.count >= 2 else { return nil }
-        let sorted = s.sorted { $0.t < $1.t }
-        var activeHours = 0.0, drop = 0.0
-        // Walk backward from the newest sample until the last charge event,
-        // summing only contiguous (in-use) intervals.
-        for i in stride(from: sorted.count - 1, to: 0, by: -1) {
-            let newer = sorted[i], older = sorted[i - 1]
-            if newer.pct > older.pct + 2 { break }        // charge → end of cycle
-            let dt = newer.t.timeIntervalSince(older.t) / 3600.0
-            if dt <= 0 || dt > GAP_MINUTES / 60.0 { continue }  // idle gap → skip
-            activeHours += dt
-            drop += Double(older.pct - newer.pct)          // ≥0 while discharging
+    // One contiguous discharge run (between two charges), with idle gaps removed.
+    struct Cycle {
+        let start: Date, end: Date
+        let activeHours: Double
+        let drop: Double
+        var rate: Double { activeHours > 0 ? drop / activeHours : 0 }   // %/hour
+    }
+
+    struct Summary {
+        let current: Cycle?          // the in-progress (latest) discharge run
+        let avgRate: Double?         // pooled %/hour across ALL logged cycles
+        let cycleCount: Int          // number of measurable discharge cycles
+        let trackingSince: Date?
+        let sampleCount: Int
+        let lastPct: Int?
+
+        // Live time-to-empty from the current cycle's rate (falls back to the
+        // lifetime average when the current cycle is too young to measure).
+        func hoursToEmpty() -> Double? {
+            guard let pct = lastPct, pct >= 0 else { return nil }
+            let rate = current?.rate ?? avgRate
+            guard let r = rate, r > 0.01 else { return nil }
+            return Double(pct) / r
         }
-        guard activeHours > 0, drop > 0 else { return nil }
-        let rate = drop / activeHours                       // %/hour of use
-        guard rate > 0.01 else { return nil }
-        let last = sorted.last!.pct
-        return (rate, Double(last) / rate, 100.0 / rate)
+        // What a full charge lasts, averaged over all history.
+        func avgFullRuntime() -> Double? {
+            guard let r = avgRate, r > 0.01 else { return nil }
+            return 100.0 / r
+        }
+    }
+
+    // Split the full log into discharge cycles (break at each charge event),
+    // measure active drain within each, then pool them for a lifetime average.
+    static func summarize(_ s: [Sample]) -> Summary {
+        let sorted = s.sorted { $0.t < $1.t }
+        guard !sorted.isEmpty else {
+            return Summary(current: nil, avgRate: nil, cycleCount: 0,
+                           trackingSince: nil, sampleCount: 0, lastPct: nil)
+        }
+
+        // Contiguous index ranges between charge events; the last one is live.
+        var ranges: [(Int, Int)] = []
+        var segStart = 0
+        for i in 1..<sorted.count {
+            if sorted[i].pct > sorted[i - 1].pct + CHARGE_JUMP {
+                ranges.append((segStart, i - 1))
+                segStart = i
+            }
+        }
+        ranges.append((segStart, sorted.count - 1))
+
+        func measure(_ from: Int, _ to: Int) -> Cycle? {
+            guard to > from else { return nil }
+            var activeHours = 0.0, drop = 0.0
+            for i in (from + 1)...to {
+                let older = sorted[i - 1], newer = sorted[i]
+                let dt = newer.t.timeIntervalSince(older.t) / 3600.0
+                if dt <= 0 || dt > GAP_MINUTES / 60.0 { continue }  // idle → skip
+                activeHours += dt
+                drop += Double(older.pct - newer.pct)               // ≥0 draining
+            }
+            guard activeHours > 0, drop > 0 else { return nil }
+            return Cycle(start: sorted[from].t, end: sorted[to].t,
+                         activeHours: activeHours, drop: drop)
+        }
+
+        var cycles: [Cycle] = []
+        for r in ranges { if let c = measure(r.0, r.1) { cycles.append(c) } }
+        let current = measure(ranges.last!.0, ranges.last!.1)
+
+        let totalActive = cycles.reduce(0) { $0 + $1.activeHours }
+        let totalDrop = cycles.reduce(0) { $0 + $1.drop }
+        let avgRate = totalActive > 0 && totalDrop > 0
+            ? totalDrop / totalActive : nil
+
+        return Summary(current: current, avgRate: avgRate,
+                       cycleCount: cycles.count, trackingSince: sorted.first?.t,
+                       sampleCount: sorted.count, lastPct: sorted.last?.pct)
     }
 }
 
@@ -125,6 +183,21 @@ final class BatteryReader: NSObject, CBCentralManagerDelegate {
         }
     }
 
+    // Reset: archive the current log to a timestamped backup and start fresh.
+    // The old data is moved aside (never deleted), so a reset is recoverable.
+    @discardableResult
+    func archiveLog() -> URL? {
+        lastLogged = .distantPast          // log the next reading immediately
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: LOG_URL.path) else { return nil }
+        let stamp = DateFormatter()
+        stamp.dateFormat = "yyyyMMdd-HHmmss"
+        let dst = LOG_URL.deletingLastPathComponent()
+            .appendingPathComponent("battery_log.\(stamp.string(from: Date())).csv")
+        try? fm.moveItem(at: LOG_URL, to: dst)
+        return dst
+    }
+
     func loadSamples() -> [Sample] {
         guard let text = try? String(contentsOf: LOG_URL, encoding: .utf8)
         else { return [] }
@@ -173,13 +246,33 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(header("AirPods Max — \(pct >= 0 ? "\(pct)%" : "—")"))
         menu.addItem(.separator())
 
-        if let a = Analyzer.drain(reader.loadSamples()) {
-            menu.addItem(info(String(format: "Draining %.1f%%/hour", a.rate)))
-            menu.addItem(info("Time to empty: \(fmtHours(a.hoursToEmpty))"))
-            menu.addItem(info("Est. full-charge runtime: \(fmtHours(a.fullRuntime))"))
-        } else {
+        let s = Analyzer.summarize(reader.loadSamples())
+
+        // Live estimate for the charge you're on right now.
+        if let c = s.current {
+            menu.addItem(info(String(format: "Draining %.1f%%/hour (this charge)",
+                                     c.rate)))
+        }
+        if let h = s.hoursToEmpty() {
+            menu.addItem(info("Time to empty: \(fmtHours(h))"))
+        }
+
+        // Lifetime history, pooled across every logged charge cycle.
+        if let full = s.avgFullRuntime() {
+            let n = s.cycleCount
+            menu.addItem(info("Full charge lasts ~\(fmtHours(full)) "
+                              + "(avg of \(n) cycle\(n == 1 ? "" : "s"))"))
+        }
+
+        if s.current == nil && s.avgRate == nil {
             menu.addItem(info("Runtime: gathering data…"))
             menu.addItem(info("(needs a bit of discharge history)"))
+        }
+
+        if let since = s.trackingSince {
+            let df = DateFormatter(); df.dateFormat = "MMM d"
+            menu.addItem(info("Tracked since \(df.string(from: since)) · "
+                              + "\(s.sampleCount) readings"))
         }
 
         menu.addItem(.separator())
@@ -187,6 +280,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                  action: #selector(openLog), keyEquivalent: "")
         logItem.target = self
         menu.addItem(logItem)
+        let resetItem = NSMenuItem(title: "Reset history…",
+                                   action: #selector(resetHistory), keyEquivalent: "")
+        resetItem.target = self
+        menu.addItem(resetItem)
         let quit = NSMenuItem(title: "Quit", action: #selector(quit),
                               keyEquivalent: "q")
         quit.target = self
@@ -200,6 +297,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let i = NSMenuItem(title: s, action: nil, keyEquivalent: ""); i.isEnabled = false; return i
     }
     @objc private func openLog() { NSWorkspace.shared.open(LOG_URL) }
+
+    @objc private func resetHistory() {
+        let alert = NSAlert()
+        alert.messageText = "Reset battery history?"
+        alert.informativeText = "The runtime estimate and the CSV log will start "
+            + "fresh. Your existing data is moved to a timestamped backup next to "
+            + "the log (battery_log.<date>.csv), not deleted."
+        alert.addButton(withTitle: "Reset")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        reader.archiveLog()
+        render(reader.lastPct)
+    }
+
     @objc private func quit() { NSApp.terminate(nil) }
 }
 

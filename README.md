@@ -8,12 +8,20 @@ but public CoreBluetooth. No private frameworks, no network, no dependencies.
 🎧 43%
 ────────────────────────────
 AirPods Max — 43%
-Draining 4.8%/hour
+Draining 4.8%/hour (this charge)
 Time to empty: 8h 57m
-Est. full-charge runtime: 20h 50m
+Full charge lasts ~20h 50m (avg of 6 cycles)
+Tracked since Jul 8 · 412 readings
+────────────────────────────
 Open battery log (CSV)
+Reset history…
 Quit
 ```
+
+The runtime figure is pooled across **every** logged charge cycle, so it keeps
+improving over time instead of resetting each time you charge. **Reset history…**
+archives the log to a timestamped backup (`battery_log.<date>.csv`, never
+deleted) and starts fresh.
 
 ## Why this exists
 

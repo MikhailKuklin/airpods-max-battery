@@ -1,9 +1,9 @@
 # build artifact
 AirPodsMaxBattery.app/
 
-# personal battery data + logs
+# personal battery data + logs (incl. reset backups: battery_log.<date>.csv)
 battery_log.csv
-battery_log.wrongbyte.csv
+battery_log.*.csv
 monitor.log
 
 # compiled probe binaries (only .swift/.m sources are tracked)
