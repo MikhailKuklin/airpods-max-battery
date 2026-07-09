@@ -122,21 +122,33 @@ final class Analyzer {
 // ── CoreBluetooth reader ────────────────────────────────────────────────────
 final class BatteryReader: NSObject, CBCentralManagerDelegate {
     private var central: CBCentralManager!
-    private(set) var lastPct: Int = -1
+    private(set) var lastPct: Int = -1            // last VALID battery %, or -1
+    // The single source of truth for what the menu bar should show. Battery %
+    // (0–100), or a negative status code: -1 searching, -2 no permission, -3 BT
+    // off. Everything goes through set(display:) so a transient error state is
+    // corrected by the very next valid reading — even if the % hasn't changed.
+    private(set) var displayCode: Int = -1
     private var lastLogged: Date = .distantPast
     var onUpdate: ((Int) -> Void)?
 
     func start() { central = CBCentralManager(delegate: self, queue: nil) }
 
+    private func set(display code: Int) {
+        guard code != displayCode else { return }   // no spurious refreshes
+        displayCode = code
+        onUpdate?(code)
+    }
+
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
         switch c.state {
         case .poweredOn:
+            set(display: lastPct >= 0 ? lastPct : -1)   // resume; -1 = searching
             c.scanForPeripherals(withServices: nil,
                 options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         case .unauthorized:
-            onUpdate?(-2)
+            set(display: -2)
         case .poweredOff:
-            onUpdate?(-3)
+            set(display: -3)
         default:
             break
         }
@@ -152,10 +164,8 @@ final class BatteryReader: NSObject, CBCentralManagerDelegate {
         let raw = d[BATTERY_INDEX]
         guard raw != UNKNOWN, raw <= 100 else { return }
         let pct = Int(raw)
-        if pct != lastPct {
-            lastPct = pct
-            onUpdate?(pct)
-        }
+        lastPct = pct
+        set(display: pct)          // also clears any stale error/searching title
         maybeLog(pct)
     }
 
@@ -227,7 +237,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // Refresh the runtime estimate each time the user opens the menu.
-    func menuNeedsUpdate(_ m: NSMenu) { render(reader.lastPct) }
+    func menuNeedsUpdate(_ m: NSMenu) { render(reader.displayCode) }
 
     private func fmtHours(_ h: Double) -> String {
         if h.isInfinite || h.isNaN { return "—" }
@@ -237,6 +247,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func render(_ pct: Int) {
         switch pct {
+        case -1: statusItem.button?.title = "🎧 …"        // searching for the Max
         case -2: statusItem.button?.title = "AirPods ⚠︎ no BT permission"
         case -3: statusItem.button?.title = "AirPods ⚠︎ BT off"
         default: statusItem.button?.title = "🎧 \(pct)%"
