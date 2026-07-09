@@ -25,6 +25,10 @@ let LOG_URL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("airpods-max-battery/battery_log.csv")
 let LOG_INTERVAL: TimeInterval = 120   // don't write more than one row / 2 min
 let UNKNOWN: UInt8 = 0xff
+// While worn/awake the Max broadcast the advertisement many times a second; in
+// the case or off the head they go silent. If we haven't heard a reading in this
+// long, the displayed % is stale (last-known), not live.
+let STALE_SECONDS: TimeInterval = 300
 
 struct Sample { let t: Date; let pct: Int }
 
@@ -128,8 +132,16 @@ final class BatteryReader: NSObject, CBCentralManagerDelegate {
     // off. Everything goes through set(display:) so a transient error state is
     // corrected by the very next valid reading — even if the % hasn't changed.
     private(set) var displayCode: Int = -1
+    private(set) var lastSeen: Date = .distantPast   // last valid advertisement
     private var lastLogged: Date = .distantPast
     var onUpdate: ((Int) -> Void)?
+
+    // The last reading is stale (Max asleep / in the case) if we've shown a real
+    // % but haven't heard an advertisement in a while.
+    var isStale: Bool {
+        displayCode >= 0 && Date().timeIntervalSince(lastSeen) > STALE_SECONDS
+    }
+    var secondsSinceSeen: TimeInterval { Date().timeIntervalSince(lastSeen) }
 
     func start() { central = CBCentralManager(delegate: self, queue: nil) }
 
@@ -165,6 +177,7 @@ final class BatteryReader: NSObject, CBCentralManagerDelegate {
         guard raw != UNKNOWN, raw <= 100 else { return }
         let pct = Int(raw)
         lastPct = pct
+        lastSeen = Date()
         set(display: pct)          // also clears any stale error/searching title
         maybeLog(pct)
     }
@@ -226,6 +239,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let reader = BatteryReader()
     let menu = NSMenu()
 
+    private var refreshTimer: Timer?
+
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem.button?.title = "AirPods …"
         menu.delegate = self               // rebuild every time it's opened
@@ -234,6 +249,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { self?.render(pct) }
         }
         reader.start()
+        // The Max stop broadcasting when idle/in the case, so no callback tells
+        // us the reading went stale — poll the title on a timer to catch it.
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) {
+            [weak self] _ in self?.updateTitle()
+        }
     }
 
     // Refresh the runtime estimate each time the user opens the menu.
@@ -245,16 +265,35 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return hh > 0 ? "\(hh)h \(mm)m" : "\(mm)m"
     }
 
-    private func render(_ pct: Int) {
+    private func fmtAgo(_ secs: TimeInterval) -> String {
+        let s = Int(secs)
+        if s < 60 { return "\(s)s" }
+        if s < 3600 { return "\(s / 60)m" }
+        return "\(s / 3600)h \((s % 3600) / 60)m"
+    }
+
+    private func titleString(_ pct: Int) -> String {
         switch pct {
-        case -1: statusItem.button?.title = "🎧 …"        // searching for the Max
-        case -2: statusItem.button?.title = "AirPods ⚠︎ no BT permission"
-        case -3: statusItem.button?.title = "AirPods ⚠︎ BT off"
-        default: statusItem.button?.title = "🎧 \(pct)%"
+        case -1: return "🎧 …"                       // searching for the Max
+        case -2: return "AirPods ⚠︎ no BT permission"
+        case -3: return "AirPods ⚠︎ BT off"
+        // A leading ~ marks a last-known (stale) reading — the Max are silent.
+        default: return reader.isStale ? "🎧 ~\(pct)%" : "🎧 \(pct)%"
         }
+    }
+
+    // Lightweight: just the menu-bar title (called every 30s by the timer).
+    private func updateTitle() { statusItem.button?.title = titleString(reader.displayCode) }
+
+    private func render(_ pct: Int) {
+        updateTitle()
 
         menu.removeAllItems()
         menu.addItem(header("AirPods Max — \(pct >= 0 ? "\(pct)%" : "—")"))
+        if reader.isStale {
+            menu.addItem(info("Last seen \(fmtAgo(reader.secondsSinceSeen)) ago "
+                              + "· asleep or in case"))
+        }
         menu.addItem(.separator())
 
         let s = Analyzer.summarize(reader.loadSamples())

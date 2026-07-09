@@ -23,6 +23,11 @@ improving over time instead of resetting each time you charge. **Reset history�
 archives the log to a timestamped backup (`battery_log.<date>.csv`, never
 deleted) and starts fresh.
 
+The Max stop broadcasting when they're in the case or off your head, so once no
+advertisement has arrived for a few minutes the reading is shown as `🎧 ~85%`
+(the `~` means "last known", not live) with a "Last seen … ago" note in the
+menu — rather than pretending the stale number is current.
+
 ## Why this exists
 
 macOS does **not** expose the AirPods Max battery to any command-line tool —
